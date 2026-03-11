@@ -1,23 +1,27 @@
 """
 Teams Message Watcher — calls your phone when your manager messages you.
 
+Monitors Windows toast notifications from Microsoft Teams.
+No Azure AD or Microsoft account sign-in needed.
+
 Prerequisites:
   pip install -r requirements.txt
 
 Setup:
-  1. Register an app in Azure AD (portal.azure.com -> App registrations):
-     - Redirect URI: http://localhost
-     - API Permissions: Chat.Read (delegated), User.Read (delegated)
-     - Enable "Allow public client flows"
-  2. Create a Twilio account at twilio.com and get:
+  1. Create a Twilio account at twilio.com and get:
      - Account SID, Auth Token, a Twilio phone number
-  3. Copy .env.example to .env and fill in your values.
+  2. Copy .env.example to .env and fill in your values.
+  3. Make sure Teams desktop is running with notifications enabled.
 """
 
 import os
+import sys
 import time
+import shutil
+import sqlite3
+import tempfile
 import logging
-from datetime import datetime, timezone
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # Load .env file if python-dotenv is available
@@ -29,40 +33,25 @@ try:
 except ImportError:
     pass
 
-import msal
-import requests
 from twilio.rest import Client as TwilioClient
 
 # ── Config ───────────────────────────────────────────────────────────────────
-# Azure AD app registration
-AZURE_CLIENT_ID = os.environ.get("AZURE_CLIENT_ID", "")
-AZURE_TENANT_ID = os.environ.get("AZURE_TENANT_ID", "")
-
-# Manager's display name or email (used to match incoming messages)
 MANAGER_NAME = os.environ.get("MANAGER_NAME", "")
 MANAGER_EMAIL = os.environ.get("MANAGER_EMAIL", "")
 
-# Twilio
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "")
 MY_PHONE_NUMBER = os.environ.get("MY_PHONE_NUMBER", "")
 
-# How often to check for new messages (seconds)
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "15"))
-
-# Minimum seconds between phone calls (avoid spam-calling yourself)
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 CALL_COOLDOWN = int(os.environ.get("CALL_COOLDOWN", "120"))
 
-# ── Validation ───────────────────────────────────────────────────────────────
-_REQUIRED = {
-    "AZURE_CLIENT_ID": AZURE_CLIENT_ID,
-    "AZURE_TENANT_ID": AZURE_TENANT_ID,
-    "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
-    "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
-    "TWILIO_FROM_NUMBER": TWILIO_FROM_NUMBER,
-    "MY_PHONE_NUMBER": MY_PHONE_NUMBER,
-}
+# Windows notification database
+NOTIFICATION_DB = (
+    Path(os.environ.get("LOCALAPPDATA", ""))
+    / "Microsoft" / "Windows" / "Notifications" / "wpndatabase.db"
+)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -72,78 +61,100 @@ logging.basicConfig(
 log = logging.getLogger("teams-watcher")
 
 
-# ── Auth (device-code flow — no client secret needed) ────────────────────────
-SCOPES = ["Chat.Read", "User.Read"]
+# ── Notification DB helpers ──────────────────────────────────────────────────
 
-def get_access_token() -> str:
-    """Authenticate via interactive device-code flow and return an access token."""
-    authority = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
-    app = msal.PublicClientApplication(AZURE_CLIENT_ID, authority=authority)
-
-    # Try cached token first
-    accounts = app.get_accounts()
-    if accounts:
-        result = app.acquire_token_silent(SCOPES, account=accounts[0])
-        if result and "access_token" in result:
-            return result["access_token"]
-
-    # Interactive device-code flow
-    flow = app.initiate_device_flow(scopes=SCOPES)
-    if "user_code" not in flow:
-        raise RuntimeError(f"Device flow failed: {flow.get('error_description', 'unknown error')}")
-
-    print()
-    print("=" * 54)
-    print(f"  Open:  {flow['verification_uri']}")
-    print(f"  Code:  {flow['user_code']}")
-    print("=" * 54)
-    print()
-
-    result = app.acquire_token_by_device_flow(flow)
-    if "access_token" not in result:
-        raise RuntimeError(f"Auth failed: {result.get('error_description', 'unknown error')}")
-    log.info("Authenticated successfully.")
-    return result["access_token"]
+def _safe_copy_db() -> Path:
+    """Copy notification DB + WAL/SHM files to temp for safe reading."""
+    temp_dir = Path(tempfile.gettempdir()) / "teams_watcher"
+    temp_dir.mkdir(exist_ok=True)
+    dest = temp_dir / "wpndatabase.db"
+    shutil.copy2(NOTIFICATION_DB, dest)
+    for suffix in ("-wal", "-shm"):
+        src = NOTIFICATION_DB.with_name(NOTIFICATION_DB.name + suffix)
+        if src.exists():
+            shutil.copy2(src, dest.with_name(dest.name + suffix))
+    return dest
 
 
-# ── Graph helpers ────────────────────────────────────────────────────────────
-GRAPH = "https://graph.microsoft.com/v1.0"
-
-def graph_get(token: str, url: str):
-    """Make a GET request to Microsoft Graph."""
-    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_chats(token: str):
-    """Return the user's recent chats."""
-    return graph_get(token, f"{GRAPH}/me/chats?$top=50")["value"]
+def _find_teams_handler_ids(cursor: sqlite3.Cursor) -> list:
+    """Return handler IDs that belong to Microsoft Teams."""
+    cursor.execute("SELECT RecordId, PrimaryId FROM NotificationHandler")
+    return [
+        row[0] for row in cursor.fetchall()
+        if "teams" in (row[1] or "").lower()
+    ]
 
 
-def get_recent_messages(token: str, chat_id: str, since: str):
-    """Return messages in a chat newer than `since` (ISO-8601)."""
-    url = (
-        f"{GRAPH}/me/chats/{chat_id}/messages"
-        f"?$top=20&$orderby=createdDateTime desc"
-        f"&$filter=createdDateTime gt {since}"
-    )
+def get_new_notifications(since_order: int = 0) -> tuple:
+    """
+    Read new Teams toast notifications from the Windows notification DB.
+    Returns (list_of_notifications, max_order_seen).
+    """
+    db_path = _safe_copy_db()
+    results = []
+    max_order = since_order
+
     try:
-        return graph_get(token, url).get("value", [])
-    except requests.HTTPError:
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        handler_ids = _find_teams_handler_ids(cur)
+        if not handler_ids:
+            conn.close()
+            return results, max_order
+
+        placeholders = ",".join("?" for _ in handler_ids)
+        cur.execute(
+            f"SELECT [Order], HandlerId, Type, Payload FROM Notification "
+            f"WHERE HandlerId IN ({placeholders}) AND [Order] > ? "
+            f"ORDER BY [Order] ASC",
+            [*handler_ids, since_order],
+        )
+
+        for row in cur.fetchall():
+            order = row["Order"]
+            max_order = max(max_order, order)
+            payload = row["Payload"]
+            if payload:
+                results.append({"order": order, "payload": payload})
+
+        conn.close()
+    except (sqlite3.Error, OSError) as exc:
+        log.warning("Could not read notification DB: %s", exc)
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            p = db_path.with_name(db_path.name + suffix)
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    return results, max_order
+
+
+def extract_texts(payload) -> list:
+    """Pull all <text> values from a toast notification XML payload."""
+    try:
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8", errors="replace")
+        root = ET.fromstring(payload)
+        return [t.text.strip() for t in root.iter("text") if t.text]
+    except ET.ParseError:
         return []
 
 
-def is_from_manager(message: dict) -> bool:
-    """Check whether a message was sent by the manager."""
-    sender = message.get("from", {})
-    user = sender.get("user", {}) if sender else {}
-    display_name = (user.get("displayName") or "").lower()
-    email = (user.get("email") or user.get("userPrincipalName") or "").lower()
-    return (
-        (MANAGER_NAME and MANAGER_NAME.lower() in display_name)
-        or (MANAGER_EMAIL and MANAGER_EMAIL.lower() == email)
-    )
+def matches_manager(texts: list) -> bool:
+    """Return True if any text element matches the manager's name or email."""
+    terms = []
+    if MANAGER_NAME:
+        terms.append(MANAGER_NAME.strip().lower())
+    if MANAGER_EMAIL:
+        terms.append(MANAGER_EMAIL.strip().lower())
+    if not terms:
+        return False
+    blob = " ".join(texts).lower()
+    return any(t in blob for t in terms)
 
 
 # ── Twilio ───────────────────────────────────────────────────────────────────
@@ -155,72 +166,80 @@ def call_phone():
         from_=TWILIO_FROM_NUMBER,
         twiml=(
             "<Response>"
-            "<Say voice='alice'>You have a new Teams message from your manager.</Say>"
-            "<Pause length='2'/>"
+            "<Say voice='alice'>Your manager sent you a message on Teams.</Say>"
+            "<Pause length='1'/>"
             "<Say voice='alice'>Check Teams now.</Say>"
             "</Response>"
         ),
     )
-    log.info("Phone call initiated  —  SID: %s", call.sid)
+    log.info("Call initiated — SID: %s", call.sid)
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
 def main():
-    # Check required config
-    missing = [k for k, v in _REQUIRED.items() if not v]
+    if sys.platform != "win32":
+        log.error("This tool only works on Windows (monitors Windows notifications).")
+        sys.exit(1)
+
+    # Validate config
+    required = {
+        "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
+        "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
+        "TWILIO_FROM_NUMBER": TWILIO_FROM_NUMBER,
+        "MY_PHONE_NUMBER": MY_PHONE_NUMBER,
+    }
+    missing = [k for k, v in required.items() if not v]
     if missing:
-        print("ERROR: The following required values are not set:")
-        for m in missing:
-            print(f"  - {m}")
-        print("\nCopy .env.example to .env and fill in your values.")
-        return
+        log.error("Missing required .env values: %s", ", ".join(missing))
+        sys.exit(1)
 
     if not MANAGER_NAME and not MANAGER_EMAIL:
-        print("ERROR: Set at least one of MANAGER_NAME or MANAGER_EMAIL.")
-        return
+        log.error("Set at least MANAGER_NAME or MANAGER_EMAIL in .env")
+        sys.exit(1)
 
-    token = get_access_token()
-    last_check = datetime.now(timezone.utc).isoformat()
+    if not NOTIFICATION_DB.exists():
+        log.error("Notification database not found: %s", NOTIFICATION_DB)
+        log.error("Make sure you are running Windows 10 or later.")
+        sys.exit(1)
+
+    # Baseline: note current max so we only alert on NEW notifications
+    _, last_order = get_new_notifications(since_order=0)
     last_call_time = 0.0
 
-    log.info("Watching Teams messages every %ds.", POLL_INTERVAL)
-    log.info("Manager: %s (%s)", MANAGER_NAME, MANAGER_EMAIL)
+    log.info("Teams Watcher started (Windows notification mode)")
+    log.info("Watching for: %s", MANAGER_NAME or MANAGER_EMAIL)
     log.info("Will call: %s", MY_PHONE_NUMBER)
+    log.info("Poll: %ds | Cooldown: %ds", POLL_INTERVAL, CALL_COOLDOWN)
+    log.info("Keep Teams desktop running with notifications ON.")
+    print()
 
-    while True:
-        time.sleep(POLL_INTERVAL)
-        now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        while True:
+            time.sleep(POLL_INTERVAL)
+            try:
+                notifications, new_max = get_new_notifications(since_order=last_order)
+                if new_max > last_order:
+                    last_order = new_max
 
-        try:
-            chats = get_chats(token)
-        except requests.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 401:
-                log.warning("Token expired — re-authenticating...")
-                token = get_access_token()
-                continue
-            raise
+                for n in notifications:
+                    texts = extract_texts(n["payload"])
+                    if not matches_manager(texts):
+                        continue
 
-        manager_messaged = False
-        for chat in chats:
-            messages = get_recent_messages(token, chat["id"], last_check)
-            for msg in messages:
-                if is_from_manager(msg):
-                    preview = (msg.get("body", {}).get("content") or "")[:80]
-                    log.info("Manager message detected: %s", preview)
-                    manager_messaged = True
+                    preview = " | ".join(texts)[:120]
+                    log.info("Manager message: %s", preview)
 
-        if manager_messaged:
-            elapsed = time.time() - last_call_time
-            if elapsed >= CALL_COOLDOWN:
-                call_phone()
-                last_call_time = time.time()
-            else:
-                log.info(
-                    "Call cooldown active (%ds left) — skipping call.",
-                    int(CALL_COOLDOWN - elapsed),
-                )
-
-        last_check = now_iso
+                    now = time.time()
+                    if now - last_call_time >= CALL_COOLDOWN:
+                        call_phone()
+                        last_call_time = now
+                    else:
+                        wait = int(CALL_COOLDOWN - (now - last_call_time))
+                        log.info("Cooldown active (%ds left) — skipping call", wait)
+            except Exception as exc:
+                log.warning("Poll error: %s", exc)
+    except KeyboardInterrupt:
+        log.info("Stopped.")
 
 
 if __name__ == "__main__":
