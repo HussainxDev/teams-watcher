@@ -1,0 +1,4 @@
+msal>=1.24
+requests>=2.31
+twilio>=8.0
+python-dotenv>=1.0
